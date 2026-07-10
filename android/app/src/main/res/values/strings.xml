@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">
+        Focus Blocker necesita el servicio de accesibilidad para detectar cuando se abren aplicaciones no permitidas y mostrar la pantalla de bloqueo.
+    </string>
+</resources>
