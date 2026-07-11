@@ -43,7 +43,9 @@ class BlockAccessibilityService : AccessibilityService() {
             event.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED) return
 
         val prefs: SharedPreferences = getSharedPreferences("block_prefs", MODE_PRIVATE)
-        if (!prefs.getBoolean("block_active", false)) return
+        val blockActive = prefs.getBoolean("block_active", false)
+        val concActive = prefs.getBoolean("concentration_active", false)
+        if (!blockActive && !concActive) return
 
         val packageName: String? = if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             event.packageName?.toString()

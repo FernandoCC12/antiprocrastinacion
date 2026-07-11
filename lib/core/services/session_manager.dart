@@ -39,6 +39,7 @@ class SessionManager extends StateNotifier<SessionState?> {
   int _blockCount = 0;
   int _currentBlock = 0;
   int _currentBlockDuration = 0;
+  int _studySecondsPerBlock = 0;
   String _restRecommendation = '';
   List<String> _allowedApps = [];
 
@@ -63,6 +64,8 @@ class SessionManager extends StateNotifier<SessionState?> {
     final studySeconds = totalSeconds - restSeconds;
 
     _blockCount = (studySeconds / AppConstants.maxStudyBlock.inSeconds).ceil();
+    if (_blockCount < 2) _blockCount = 2;
+    _studySecondsPerBlock = studySeconds ~/ _blockCount;
     _studySecondsLeft = studySeconds;
     _restSecondsLeft = restSeconds;
     _totalStudySeconds = studySeconds;
@@ -108,10 +111,7 @@ class SessionManager extends StateNotifier<SessionState?> {
   void _tickStudy() {
     _timer?.cancel();
     final totalSeconds = state!.totalDurationSeconds;
-    final blockDuration = AppConstants.maxStudyBlock.inSeconds;
-    _currentBlockDuration = _studySecondsLeft > blockDuration
-        ? blockDuration
-        : _studySecondsLeft;
+    _currentBlockDuration = _studySecondsPerBlock;
 
     _updateConcentrationMode(StudyPhase.studying);
 

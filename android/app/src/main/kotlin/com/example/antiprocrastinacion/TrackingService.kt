@@ -15,10 +15,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.*
 import android.provider.Settings
 import android.util.Log
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
-import android.view.WindowManager
+import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
 
@@ -73,19 +70,19 @@ class TrackingService : Service() {
     private var concTreeProgressText: TextView? = null
     private var concTreeProgressBar: ProgressBar? = null
 
+    // ─── INTEGRIDAD DEL OVERLAY ──────────────────────────────────────────
+    // Intervalo de polling agresivo cuando el bloqueo está activo (500ms)
+    private val pollingIntervalBlockedMs = 500L
+    // Intervalo de polling normal cuando no hay bloqueo (2s)
+    private val pollingIntervalNormalMs = 2000L
+
     // ─── RECEIVERS ──────────────────────────────────────────────────────────
 
     private val showOverlayReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (isBlocked) {
                 Log.d("TrackingService", "SHOW_OVERLAY recibido → mostrando overlay")
-                if (overlayView != null) {
-                    overlayView?.visibility = View.VISIBLE
-                } else if (isConcentrationMode) {
-                    showConcentrationOverlay()
-                } else {
-                    showBlockOverlay()
-                }
+                ensureOverlayVisible()
             }
         }
     }
@@ -122,7 +119,9 @@ class TrackingService : Service() {
             concentrationBlockDurationSecs = intent.getIntExtra("blockDurationSeconds", 0)
             concentrationRecommendation = intent.getStringExtra("restRecommendation") ?: ""
 
-            if (overlayView == null) {
+            startPolling()
+
+            if (overlayView == null || !(overlayView?.isAttachedToWindow ?: false)) {
                 showConcentrationOverlay()
                 startConcentrationCountdown()
             } else {
@@ -153,7 +152,20 @@ class TrackingService : Service() {
                 showBlockOverlay()
                 startCountdown()
             }
-            startPolling()
+        }
+
+        val concActive = prefs.getBoolean("concentration_active", false)
+        if (concActive && !isBlocked) {
+            isConcentrationMode = true
+            isBlocked = true
+            concentrationPhase = prefs.getString("concentration_phase", "studying") ?: "studying"
+            concentrationCurrentBlock = prefs.getInt("concentration_block", 0)
+            concentrationTotalBlocks = prefs.getInt("concentration_total_blocks", 0)
+            concentrationBlockDurationSecs = prefs.getInt("concentration_block_duration", 0)
+            concentrationRecommendation = prefs.getString("concentration_recommendation", "") ?: ""
+
+            showConcentrationOverlay()
+            startConcentrationCountdown()
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -173,42 +185,102 @@ class TrackingService : Service() {
             startForeground(1, notification)
         }
 
-        lastEventTime = System.currentTimeMillis()
+        // Restaurar lastEventTime desde SharedPreferences para no perder tiempo
+        val savedEventTime = prefs.getLong("last_event_time", 0)
+        if (savedEventTime > 0 && savedEventTime < System.currentTimeMillis()) {
+            lastEventTime = savedEventTime
+        } else {
+            lastEventTime = System.currentTimeMillis()
+        }
         foregroundStartTime = lastEventTime
-        lastAccumulationTime = lastEventTime
-        Log.d("TrackingService", "onCreate: servicio iniciado correctamente")
+        lastAccumulationTime = prefs.getLong("last_accumulation_time", lastEventTime)
+
+        // Siempre iniciar polling (el servicio debe vivir siempre)
+        startPolling()
+
+        Log.d("TrackingService", "onCreate: servicio iniciado correctamente, isBlocked=$isBlocked, lastEventTime=$lastEventTime")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         intent?.let {
             when (it.action) {
-                ACTION_START  -> startPolling()
+                ACTION_START  -> {
+                    // Asegurar que lastEventTime se actualice correctamente
+                    val savedEventTime = prefs.getLong("last_event_time", 0)
+                    if (savedEventTime > 0 && savedEventTime < System.currentTimeMillis()) {
+                        lastEventTime = savedEventTime
+                    }
+                    foregroundStartTime = lastEventTime
+                    lastAccumulationTime = prefs.getLong("last_accumulation_time", lastEventTime)
+                    startPolling()
+                }
                 ACTION_STOP   -> stopPolling()
                 ACTION_PAUSE  -> pausePolling()
-                ACTION_RESUME -> resumePolling()
+                ACTION_RESUME -> {
+                    val savedEventTime = prefs.getLong("last_event_time", 0)
+                    if (savedEventTime > 0 && savedEventTime < System.currentTimeMillis()) {
+                        lastEventTime = savedEventTime
+                    }
+                    foregroundStartTime = lastEventTime
+                    lastAccumulationTime = prefs.getLong("last_accumulation_time", lastEventTime)
+                    resumePolling()
+                }
             }
         }
 
-        if (isBlocked && pollingRunnable == null) {
+        // Garantizar que siempre haya polling activo si el bloqueo está activo
+        if (isBlocked) {
             startPolling()
+            // Asegurar que el overlay sea visible si es necesario
+            ensureOverlayVisible()
         }
 
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.d("TrackingService", "onTaskRemoved: app removida de recientes")
+        // Persistir estado antes de posible destrucción
+        persistState()
+        // No detener el servicio - debe continuar en segundo plano
+        if (isBlocked) {
+            startPolling()
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         super.onDestroy()
-        unregisterReceiver(showOverlayReceiver)
-        unregisterReceiver(hideOverlayReceiver)
-        unregisterReceiver(concentrationModeReceiver)
+        // Persistir estado antes de destruir
+        persistState()
+        try {
+            unregisterReceiver(showOverlayReceiver)
+            unregisterReceiver(hideOverlayReceiver)
+            unregisterReceiver(concentrationModeReceiver)
+        } catch (e: Exception) {
+            Log.w("TrackingService", "Error unregistering receivers: ${e.message}")
+        }
         countdownRunnable?.let { handler.removeCallbacks(it) }
         countdownRunnable = null
-        hideBlockOverlay()
-        pausePolling()
+        pollingRunnable?.let { handler.removeCallbacks(it) }
         pollingRunnable = null
-        Log.d("TrackingService", "onDestroy: servicio detenido")
+        hideBlockOverlay()
+        Log.d("TrackingService", "onDestroy: servicio detenido, estado persistido")
+    }
+
+    private fun persistState() {
+        val editor = prefs.edit()
+        editor.putInt("accumulated_seconds", (accumulatedMillis / 1000).toInt())
+        editor.putBoolean("block_active", isBlocked)
+        if (isBlocked) {
+            editor.putLong("block_start_time", blockStartTime)
+        }
+        editor.putLong("last_event_time", lastEventTime)
+        editor.putLong("last_accumulation_time", lastAccumulationTime)
+        editor.putBoolean("concentration_active", isConcentrationMode)
+        editor.apply()
     }
 
     // ─── CICLO PRINCIPAL DE SONDEO (conteo + respaldo de visibilidad) ─────
@@ -227,7 +299,10 @@ class TrackingService : Service() {
                     accumulatedMillis += millis
                     lastAccumulationTime = System.currentTimeMillis()
                     val accumulatedSeconds = (accumulatedMillis / 1000).toInt()
-                    prefs.edit().putInt("accumulated_seconds", accumulatedSeconds).apply()
+                    prefs.edit()
+                        .putInt("accumulated_seconds", accumulatedSeconds)
+                        .putLong("last_accumulation_time", lastAccumulationTime)
+                        .apply()
                     Log.d("TrackingService", "Segundos acumulados: $accumulatedSeconds / $DISTRACT_LIMIT")
                     if (accumulatedSeconds >= DISTRACT_LIMIT) {
                         triggerBlock()
@@ -236,35 +311,12 @@ class TrackingService : Service() {
 
                 // 2. Reconciliación autoritativa del estado del overlay.
                 //    El AccessibilityService puede perder eventos (gesture nav,
-                //    fast switching, API 30+). Este ciclo verifica cada 2 s que
-                //    la visibilidad del overlay coincida con la app en primer plano.
+                //    fast switching, API 30+). Este ciclo verifica la
+                //    visibilidad del overlay coincida con la app en primer plano.
+                //    Cuando el bloqueo está activo, verificamos con frecuencia
+                //    agresiva (500ms) para minimizar ventanas de oportunidad.
                 if (isBlocked) {
-                    val allowedApps = prefs.getStringSet("allowed_apps", emptySet()) ?: emptySet()
-                    val currentPkg = getForegroundPackageSafe()
-                    val isAllowed = isAppAllowed(currentPkg, allowedApps)
-
-                    if (!isAllowed) {
-                        // App distractor → overlay DEBE ser visible
-                        val overlayMissing = overlayView == null ||
-                                !(overlayView?.isAttachedToWindow ?: false)
-                        if (overlayMissing) {
-                            if (isConcentrationMode) {
-                                showConcentrationOverlay()
-                            } else {
-                                showBlockOverlay()
-                            }
-                            Log.d("TrackingService", "Polling: overlay recreado, app distractor: $currentPkg")
-                        } else if (overlayView?.visibility != View.VISIBLE) {
-                            overlayView?.visibility = View.VISIBLE
-                            Log.d("TrackingService", "Polling: overlay restaurado a VISIBLE, app distractor: $currentPkg")
-                        }
-                    } else {
-                        // App permitida → overlay DEBE estar oculto
-                        if (overlayView != null && overlayView?.visibility == View.VISIBLE) {
-                            overlayView?.visibility = View.GONE
-                            Log.d("TrackingService", "Polling: overlay ocultado, app permitida: $currentPkg")
-                        }
-                    }
+                    ensureOverlayVisible()
                 }
 
                 // 3. Reinicio por inactividad
@@ -275,10 +327,55 @@ class TrackingService : Service() {
                     resetCounter()
                 }
 
-                handler.postDelayed(this, 2000)
+                // 4. Persistir evento de tiempo para sobrevivir muerte del servicio
+                persistState()
+
+                // 5. Programar siguiente ciclo con intervalo adaptativo
+                val interval = if (isBlocked) pollingIntervalBlockedMs else pollingIntervalNormalMs
+                handler.postDelayed(this, interval)
             }
         }
         handler.post(pollingRunnable!!)
+    }
+
+    /**
+     * Garantiza que el overlay esté visible y correctamente adjunto al window.
+     * Esta es la función central de integridad del overlay.
+     */
+    private fun ensureOverlayVisible() {
+        val allowedApps = prefs.getStringSet("allowed_apps", emptySet()) ?: emptySet()
+        val currentPkg = getForegroundPackageSafe()
+        val isAllowed = isAppAllowed(currentPkg, allowedApps)
+
+        if (!isAllowed) {
+            // App distractor o desconocida → overlay DEBE ser visible
+            val overlayMissing = overlayView == null ||
+                    !(overlayView?.isAttachedToWindow ?: false)
+            if (overlayMissing) {
+                Log.d("TrackingService", "Overlay perdido/desadjuntado → recreando, pkg=$currentPkg")
+                // Limpiar referencia inválida
+                if (overlayView != null && overlayView?.isAttachedToWindow != true) {
+                    try {
+                        windowManager?.removeView(overlayView)
+                    } catch (_: Exception) {}
+                    overlayView = null
+                }
+                if (isConcentrationMode) {
+                    showConcentrationOverlay()
+                } else {
+                    showBlockOverlay()
+                }
+            } else if (overlayView?.visibility != View.VISIBLE) {
+                overlayView?.visibility = View.VISIBLE
+                Log.d("TrackingService", "Overlay restaurado a VISIBLE, app distractor: $currentPkg")
+            }
+        } else {
+            // App permitida → overlay DEBE estar oculto
+            if (overlayView != null && overlayView?.visibility == View.VISIBLE) {
+                overlayView?.visibility = View.GONE
+                Log.d("TrackingService", "Overlay ocultado, app permitida: $currentPkg")
+            }
+        }
     }
 
     private var lastKnownForegroundPkg: String? = null
@@ -308,6 +405,7 @@ class TrackingService : Service() {
 
     private fun pausePolling() {
         pollingRunnable?.let { handler.removeCallbacks(it) }
+        pollingRunnable = null
     }
 
     private fun stopPolling() {
@@ -316,11 +414,8 @@ class TrackingService : Service() {
     }
 
     private fun resumePolling() {
-        if (pollingRunnable == null) {
-            startPolling()
-        } else {
-            handler.post(pollingRunnable!!)
-        }
+        pollingRunnable = null  // Forzar reinicio limpio
+        startPolling()
     }
 
     // ─── CONTEO DE TIEMPO ─────────────────────────────────────────────────────
@@ -380,6 +475,8 @@ class TrackingService : Service() {
         }
 
         lastEventTime = now
+        // Persistir lastEventTime para sobrevivir muerte del servicio
+        prefs.edit().putLong("last_event_time", lastEventTime).apply()
         return addedMillis
     }
 
@@ -395,6 +492,8 @@ class TrackingService : Service() {
             .apply()
         showBlockOverlay()
         startCountdown()
+        // Actualizar notificación para indicar bloqueo activo
+        updateNotification(true)
     }
 
     private fun startCountdown() {
@@ -435,6 +534,8 @@ class TrackingService : Service() {
         foregroundStartTime = System.currentTimeMillis()
         lastEventTime = foregroundStartTime
         lastAccumulationTime = foregroundStartTime
+        // Actualizar notificación para indicar monitoreo normal
+        updateNotification(false)
     }
 
     private fun resetCounter() {
@@ -450,7 +551,7 @@ class TrackingService : Service() {
         if (pkg == null) return false
         if (pkg == "com.example.antiprocrastinacion") return true
         if (pkg in allowedApps) return true
-        
+
         val currentUid = try {
             packageManager.getApplicationInfo(pkg, 0).uid
         } catch (e: Exception) {
@@ -467,6 +568,34 @@ class TrackingService : Service() {
 
     // ─── OVERLAY DE BLOQUEO (normal) ──────────────────────────────────────────
 
+    /**
+     * Crea los Windowparams estándar para overlays de bloqueo.
+     * Flags que garantizan que el overlay:
+     *  - Cubra toda la pantalla
+     *  - No permita tocar elementos detrás
+     *  - Capture eventos de teclado (BACK, etc.)
+     *  - Sea inmersivo (sin barras del sistema)
+     */
+    private fun createBlockWindowParams(): WindowManager.LayoutParams {
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            else
+                @Suppress("DEPRECATION")
+                WindowManager.LayoutParams.TYPE_SYSTEM_ALERT,
+            // Flags críticos para bloqueo efectivo:
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.CENTER
+        return params
+    }
+
     private fun showBlockOverlay() {
         if (!Settings.canDrawOverlays(this)) {
             Log.e("TrackingService", "Sin permiso de superposición (SYSTEM_ALERT_WINDOW)")
@@ -478,7 +607,11 @@ class TrackingService : Service() {
                 overlayView?.visibility = View.VISIBLE
                 return
             } else {
-                hideBlockOverlay()
+                // Limpiar referencia inválida antes de recrear
+                try {
+                    windowManager?.removeView(overlayView)
+                } catch (_: Exception) {}
+                overlayView = null
             }
         }
 
@@ -501,6 +634,19 @@ class TrackingService : Service() {
                     or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                     or View.SYSTEM_UI_FLAG_FULLSCREEN
             )
+        }
+
+        // Interceptar tecla BACK para que no cierre el overlay
+        root.isFocusableInTouchMode = true
+        root.requestFocus()
+        root.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+                // Ignorar BACK - el overlay no se puede cerrar
+                Log.d("TrackingService", "BACK bloqueado - overlay activo")
+                true
+            } else {
+                false
+            }
         }
 
         // ─── 1. STATUS BADGE ────────────────────────────────────────
@@ -781,19 +927,7 @@ class TrackingService : Service() {
         scrollView.addView(root)
         overlayView = scrollView
 
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_SYSTEM_ALERT,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.CENTER
+        val params = createBlockWindowParams()
 
         try {
             windowManager?.addView(overlayView, params)
@@ -859,7 +993,11 @@ class TrackingService : Service() {
                 updateConcentrationOverlay()
                 return
             } else {
-                hideBlockOverlay()
+                // Limpiar referencia inválida antes de recrear
+                try {
+                    windowManager?.removeView(overlayView)
+                } catch (_: Exception) {}
+                overlayView = null
             }
         }
 
@@ -882,6 +1020,18 @@ class TrackingService : Service() {
                     or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                     or View.SYSTEM_UI_FLAG_FULLSCREEN
             )
+        }
+
+        // Interceptar tecla BACK para que no cierre el overlay
+        root.isFocusableInTouchMode = true
+        root.requestFocus()
+        root.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+                Log.d("TrackingService", "BACK bloqueado - overlay de concentración activo")
+                true
+            } else {
+                false
+            }
         }
 
         // ─── 1. STATUS BADGE ────────────────────────────────────────
@@ -1201,19 +1351,7 @@ class TrackingService : Service() {
         scrollView.addView(root)
         overlayView = scrollView
 
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            else
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_SYSTEM_ALERT,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_INSET_DECOR,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.CENTER
+        val params = createBlockWindowParams()
 
         try {
             windowManager?.addView(overlayView, params)
@@ -1326,6 +1464,20 @@ class TrackingService : Service() {
             .setSmallIcon(android.R.drawable.ic_menu_manage)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
+    }
+
+    private fun updateNotification(blocked: Boolean) {
+        val channelId = "tracking_channel"
+        val title = if (blocked) "BLOQUEO ACTIVO" else "Focus Blocker activo"
+        val text = if (blocked) "Bloqueo en curso - countdown activo" else "Monitorizando uso de apps"
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSmallIcon(if (blocked) android.R.drawable.ic_lock_idle_lock else android.R.drawable.ic_menu_manage)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(1, notification)
     }
 
     // ─── CONSTANTES ──────────────────────────────────────────────────────────
